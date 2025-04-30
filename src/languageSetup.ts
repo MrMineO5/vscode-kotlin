@@ -22,8 +22,9 @@ export async function activateLanguageServer({ context, status, config, javaInst
     // Prepare language server
     const langServerInstallDir = path.join(context.globalStorageUri.fsPath, "langServerInstall");
     const customPath: string = config.get("languageServer.path");
+    const externalTcp: boolean = config.get("languageServer.externalTcp");
     
-    if (!customPath) {
+    if (!customPath && !(externalTcp && config.get("languageServer.transport") === "tcp")) {
         const langServerDownloader = new ServerDownloader("Kotlin Language Server", "kotlin-language-server", "server.zip", "server", langServerInstallDir);
         
         try {
@@ -85,7 +86,7 @@ export async function activateLanguageServer({ context, status, config, javaInst
         "**/settings.gradle"
     ];
 
-    const options = { outputChannel, startScriptPath, tcpPort, env, storagePath, fileEventsGlobPatterns };
+    const options = { outputChannel, startScriptPath, tcpPort, env, storagePath, fileEventsGlobPatterns, externalTcp };
     const languageClient = createLanguageClient(options);
 
     // Create the language client and start the client.
@@ -178,7 +179,8 @@ function createLanguageClient(options: {
     tcpPort?: number,
     env?: any,
     storagePath: string,
-    fileEventsGlobPatterns: string[]
+    fileEventsGlobPatterns: string[],
+    externalTcp?: boolean
 }): LanguageClient {
     // Options to control the language client
     const clientOptions: LanguageClientOptions = {
@@ -208,15 +210,19 @@ function createLanguageClient(options: {
     }
     
     // Ensure that start script can be executed
-    if (isOSUnixoid()) {
+    if (isOSUnixoid() && !options.externalTcp) {
         child_process.exec(`chmod +x ${options.startScriptPath}`);
     }
 
-    // Start the child Java process
+    // Start the child Java process or connect to external TCP
     let serverOptions: ServerOptions;
     
     if (options.tcpPort) {
-        serverOptions = () => spawnLanguageServerProcessAndConnectViaTcp(options);
+        if (options.externalTcp) {
+            serverOptions = () => connectToExternalTcpServerWithRetry(options.tcpPort, options.outputChannel);
+        } else {
+            serverOptions = () => spawnLanguageServerProcessAndConnectViaTcp(options);
+        }
     } else {
         serverOptions = {
             command: options.startScriptPath,
@@ -258,6 +264,37 @@ export function spawnLanguageServerProcessAndConnectViaTcp(options: {
         });
         server.on("error", e => reject(e));
     });
+}
+
+// Helper: Connect to an external TCP server with retry logic
+async function connectToExternalTcpServerWithRetry(port: number, outputChannel: vscode.OutputChannel): Promise<StreamInfo> {
+    let disposed = false;
+    let resolveFn: (info: StreamInfo) => void;
+    // let rejectFn: (err: any) => void;
+    const promise = new Promise<StreamInfo>((resolve, _reject) => {
+        resolveFn = resolve;
+        // rejectFn = reject;
+    });
+
+    async function tryConnect() {
+        if (disposed) return;
+        outputChannel.appendLine(`[Kotlin] Attempting to connect to external language server on port ${port}...`);
+        const socket = net.connect(port, '127.0.0.1');
+        socket.on('connect', () => {
+            outputChannel.appendLine(`[Kotlin] Connected to external language server on port ${port}.`);
+            resolveFn({ reader: socket, writer: socket });
+        });
+        socket.on('error', (err) => {
+            outputChannel.appendLine(`[Kotlin] Failed to connect to external language server: ${err.message}. Retrying in 2s...`);
+            setTimeout(tryConnect, 2000);
+        });
+    }
+    tryConnect();
+    // If the LanguageClient is stopped/disposed, mark as disposed
+    // (LanguageClient will close the socket, so this is just for retry loop)
+    (promise as any).dispose = () => { disposed = true; };
+    vscode.window.showInformationMessage(`Waiting for external Kotlin language server on port ${port}...`);
+    return promise;
 }
 
 export function configureLanguage(): void {
